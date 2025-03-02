@@ -228,7 +228,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing or invalid authorization header", http.StatusUnauthorized)
 		return
 	}
-	dsToken := strings.TrimPrefix(authHeader, "Bearer ") // 提取 DS token
+		dsToken := strings.TrimPrefix(authHeader, "Bearer ") // 提取 DS token
 
 	// 解析 OpenAI 请求体
 	var openAIReq OpenAIRequest
@@ -434,7 +434,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 设置 Cookie
-	cookies := getCookies(dsToken)
+	modelName := mapModelName(openAIReq.Model)
+	cookies := getCookies(dsToken, modelName)
 	var cookieStrings []string
 	for name, value := range cookies {
 		cookieStrings = append(cookieStrings, fmt.Sprintf("%s=%s", name, value))
@@ -474,16 +475,18 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 // getCookies 根据提供的 DS token 生成所需的 Cookie。
-func getCookies(dsToken string) map[string]string {
-	return map[string]string{
-		"guest_has_seen_legal_disclaimer": "true",
-		"youchat_personalization":         "true",
-		"DS":                              dsToken,                // 关键的 DS token
-		"you_subscription":                "youpro_standard_year", // 示例订阅信息
-		"youpro_subscription":             "true",
-		"ai_model":                        mapModelName(openAIReq.Model), // 示例 AI 模型
-		"youchat_smart_learn":             "true",
-	}
+
+
+func getCookies(dsToken string, modelName string) map[string]string {
+    return map[string]string{
+        "guest_has_seen_legal_disclaimer": "true",
+        "youchat_personalization":         "true",
+        "DS":                              dsToken,                // 关键的 DS token
+        "you_subscription":                "youpro_standard_year", // 示例订阅信息
+        "youpro_subscription":             "true",
+        "ai_model":                        modelName, // 使用传入的模型名称
+        "youchat_smart_learn":             "true",
+    }
 }
 
 // handleNonStreamingResponse 处理非流式请求。
