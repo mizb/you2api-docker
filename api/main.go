@@ -475,8 +475,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 // getCookies 根据提供的 DS token 生成所需的 Cookie。
-
-
 func getCookies(dsToken string, modelName string) map[string]string {
     return map[string]string{
         "guest_has_seen_legal_disclaimer": "true",
@@ -556,6 +554,7 @@ func handleNonStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 }
 
 // handleStreamingResponse 处理流式请求。
+// 修改后的函数：增加了思考内容返回
 func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 	client := &http.Client{} // 流式请求不需要设置超时，因为它会持续接收数据
 	resp, err := client.Do(youReq)
@@ -571,10 +570,113 @@ func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	scanner := bufio.NewScanner(resp.Body)
-	// 逐行扫描响应，寻找 youChatToken 事件
+	
+	// 添加变量来存储思考内容
+	var thinkingContent strings.Builder
+	var inThinkingBlock bool = false
+	
+	// 逐行扫描响应
 	for scanner.Scan() {
 		line := scanner.Text()
+		
+		// 处理思考更新事件
+		if strings.HasPrefix(line, "event: youchatupdate") {
+			scanner.Scan() // 读取下一行 (data 行)
+			data := scanner.Text()
+			if !strings.HasPrefix(data, "data: ") {
+				continue
+			}
+			
+			// 解析 youchatupdate 数据
+			var updateData map[string]interface{}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(data, "data: ")), &updateData); err != nil {
+				continue
+			}
+			
+			// 检查是否是思考块的开始或结束
+			if msg, ok := updateData["msg"].(string); ok && msg == "thinking" {
+				if done, ok := updateData["done"].(bool); ok {
+					if !done {
+						// 思考块开始
+						inThinkingBlock = true
+					} else {
+						// 思考块结束
+						inThinkingBlock = false
+						
+						// 思考内容结束，发送完整的思考内容作为 tool_call
+						if thinkingContent.Len() > 0 {
+							// 构建 OpenAI 格式的工具调用响应
+							toolCallResp := OpenAIStreamResponse{
+								ID:      "chatcmpl-" + fmt.Sprintf("%d", time.Now().Unix()),
+								Object:  "chat.completion.chunk",
+								Created: time.Now().Unix(),
+								Model:   reverseMapModelName(mapModelName(originalModel)),
+								Choices: []Choice{
+									{
+										Delta: Delta{
+											Content: "",
+										},
+										Index:        0,
+										FinishReason: "",
+									},
+								},
+							}
+							
+							// 添加 tool_calls 字段
+							toolCallBytes, _ := json.Marshal(map[string]interface{}{
+								"tool_calls": []map[string]interface{}{
+									{
+										"index": 0,
+										"id": "call_" + fmt.Sprintf("%d", time.Now().Unix()),
+										"type": "function",
+										"function": map[string]interface{}{
+											"name": "thinking",
+											"arguments": fmt.Sprintf("{\"thinking\": %q}", thinkingContent.String()),
+										},
+									},
+								},
+							})
+							
+							// 转换为正确的 JSON 结构
+							var deltaObj map[string]interface{}
+							json.Unmarshal(toolCallBytes, &deltaObj)
+							
+							// 重新序列化 OpenAI 响应，包含 tool_calls
+							toolCallResp.Choices[0].Delta = Delta{Content: ""}
+							toolCallRespBytes, _ := json.Marshal(toolCallResp)
+							
+							// 将 tool_calls 嵌入到 delta 中
+							toolCallRespStr := string(toolCallRespBytes)
+							toolCallRespStr = strings.Replace(
+								toolCallRespStr, 
+								"\"delta\":{\"content\":\"\"}",
+								fmt.Sprintf("\"delta\":%s", string(toolCallBytes)),
+								1,
+							)
+							
+							// 发送工具调用响应
+							fmt.Fprintf(w, "data: %s\n\n", toolCallRespStr)
+							w.(http.Flusher).Flush()
+							
+							// 清空思考内容缓存
+							thinkingContent.Reset()
+						}
+					}
+				}
+			}
+			
+			// 如果处于思考块中，且有文本更新，则收集思考内容
+			if inThinkingBlock {
+				if t, ok := updateData["t"].(string); ok {
+					thinkingContent.WriteString(t)
+				}
+			}
+			
+			// 继续处理正常的 token 更新
+			continue
+		}
 
+		// 处理 youChatToken 事件（标准文本输出）
 		if strings.HasPrefix(line, "event: youChatToken") {
 			scanner.Scan()         // 读取下一行 (data 行)
 			data := scanner.Text() // 获取数据行
@@ -605,6 +707,9 @@ func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 		}
 	}
 
+	// 发送完成事件
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	w.(http.Flusher).Flush()
 }
 
 // 获取上传文件所需的 nonce
