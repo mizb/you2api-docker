@@ -50,7 +50,8 @@ type Choice struct {
 
 // Delta 定义了流式响应中表示增量内容的结构。
 type Delta struct {
-	Content string `json:"content"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // OpenAIRequest 定义了 OpenAI API 请求体的结构。
@@ -228,7 +229,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing or invalid authorization header", http.StatusUnauthorized)
 		return
 	}
-		dsToken := strings.TrimPrefix(authHeader, "Bearer ") // 提取 DS token
+	dsToken := strings.TrimPrefix(authHeader, "Bearer ") // 提取 DS token
 
 	// 解析 OpenAI 请求体
 	var openAIReq OpenAIRequest
@@ -476,15 +477,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 // getCookies 根据提供的 DS token 生成所需的 Cookie。
 func getCookies(dsToken string, modelName string) map[string]string {
-    return map[string]string{
-        "guest_has_seen_legal_disclaimer": "true",
-        "youchat_personalization":         "true",
-        "DS":                              dsToken,                // 关键的 DS token
-        "you_subscription":                "youpro_standard_year", // 示例订阅信息
-        "youpro_subscription":             "true",
-        "ai_model":                        modelName, // 使用传入的模型名称
-        "youchat_smart_learn":             "true",
-    }
+	return map[string]string{
+		"guest_has_seen_legal_disclaimer": "true",
+		"youchat_personalization":         "true",
+		"DS":                              dsToken,                // 关键的 DS token
+		"you_subscription":                "youpro_standard_year", // 示例订阅信息
+		"youpro_subscription":             "true",
+		"ai_model":                        modelName, // 使用传入的模型名称
+		"youchat_smart_learn":             "true",
+	}
 }
 
 // handleNonStreamingResponse 处理非流式请求。
@@ -555,8 +556,9 @@ func handleNonStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 
 // handleStreamingResponse 处理流式请求。
 // 修改后的函数：增加了思考内容返回
+// 修改后的流式响应处理函数
 func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
-	client := &http.Client{} // 流式请求不需要设置超时，因为它会持续接收数据
+	client := &http.Client{}
 	resp, err := client.Do(youReq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -564,152 +566,99 @@ func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// 设置流式响应的头部
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
 	scanner := bufio.NewScanner(resp.Body)
-	
-	// 添加变量来存储思考内容
-	var thinkingContent strings.Builder
-	var inThinkingBlock bool = false
-	
-	// 逐行扫描响应
+	var thinkingBuffer strings.Builder
+	var isThinkingPhase bool
+
 	for scanner.Scan() {
 		line := scanner.Text()
-		
-		// 处理思考更新事件
+
+		// 处理思考阶段
 		if strings.HasPrefix(line, "event: youchatupdate") {
-			scanner.Scan() // 读取下一行 (data 行)
+			scanner.Scan()
 			data := scanner.Text()
-			if !strings.HasPrefix(data, "data: ") {
-				continue
+
+			var update struct {
+				Msg  string `json:"msg"`
+				Done bool   `json:"done"`
+				T    string `json:"t,omitempty"`
 			}
-			
-			// 解析 youchatupdate 数据
-			var updateData map[string]interface{}
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(data, "data: ")), &updateData); err != nil {
-				continue
-			}
-			
-			// 检查是否是思考块的开始或结束
-			if msg, ok := updateData["msg"].(string); ok && msg == "thinking" {
-				if done, ok := updateData["done"].(bool); ok {
-					if !done {
-						// 思考块开始
-						inThinkingBlock = true
-					} else {
-						// 思考块结束
-						inThinkingBlock = false
-						
-						// 思考内容结束，发送完整的思考内容作为 tool_call
-						if thinkingContent.Len() > 0 {
-							// 构建 OpenAI 格式的工具调用响应
-							toolCallResp := OpenAIStreamResponse{
-								ID:      "chatcmpl-" + fmt.Sprintf("%d", time.Now().Unix()),
-								Object:  "chat.completion.chunk",
-								Created: time.Now().Unix(),
-								Model:   reverseMapModelName(mapModelName(originalModel)),
-								Choices: []Choice{
-									{
-										Delta: Delta{
-											Content: "",
-										},
-										Index:        0,
-										FinishReason: "",
-									},
-								},
-							}
-							
-							// 添加 tool_calls 字段
-							toolCallBytes, _ := json.Marshal(map[string]interface{}{
-								"tool_calls": []map[string]interface{}{
-									{
-										"index": 0,
-										"id": "call_" + fmt.Sprintf("%d", time.Now().Unix()),
-										"type": "function",
-										"function": map[string]interface{}{
-											"name": "thinking",
-											"arguments": fmt.Sprintf("{\"thinking\": %q}", thinkingContent.String()),
-										},
-									},
-								},
-							})
-							
-							// 转换为正确的 JSON 结构
-							var deltaObj map[string]interface{}
-							json.Unmarshal(toolCallBytes, &deltaObj)
-							
-							// 重新序列化 OpenAI 响应，包含 tool_calls
-							toolCallResp.Choices[0].Delta = Delta{Content: ""}
-							toolCallRespBytes, _ := json.Marshal(toolCallResp)
-							
-							// 将 tool_calls 嵌入到 delta 中
-							toolCallRespStr := string(toolCallRespBytes)
-							toolCallRespStr = strings.Replace(
-								toolCallRespStr, 
-								"\"delta\":{\"content\":\"\"}",
-								fmt.Sprintf("\"delta\":%s", string(toolCallBytes)),
-								1,
-							)
-							
-							// 发送工具调用响应
-							fmt.Fprintf(w, "data: %s\n\n", toolCallRespStr)
-							w.(http.Flusher).Flush()
-							
-							// 清空思考内容缓存
-							thinkingContent.Reset()
-						}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(data, "data: ")), &update); err == nil {
+				if update.Msg == "thinking" {
+					isThinkingPhase = !update.Done
+					if update.Done && thinkingBuffer.Len() > 0 {
+						// 发送完整思考内容
+						sendReasoningChunk(w, thinkingBuffer.String())
+						thinkingBuffer.Reset()
 					}
+				} else if isThinkingPhase && update.T != "" {
+					// 收集思考片段
+					thinkingBuffer.WriteString(update.T)
 				}
 			}
-			
-			// 如果处于思考块中，且有文本更新，则收集思考内容
-			if inThinkingBlock {
-				if t, ok := updateData["t"].(string); ok {
-					thinkingContent.WriteString(t)
-				}
-			}
-			
-			// 继续处理正常的 token 更新
 			continue
 		}
 
-		// 处理 youChatToken 事件（标准文本输出）
+		// 处理正常响应内容
 		if strings.HasPrefix(line, "event: youChatToken") {
-			scanner.Scan()         // 读取下一行 (data 行)
-			data := scanner.Text() // 获取数据行
+			scanner.Scan()
+			data := scanner.Text()
 
 			var token YouChatResponse
-			json.Unmarshal([]byte(strings.TrimPrefix(data, "data: ")), &token) // 解析 JSON
-
-			// 构建 OpenAI 格式的流式响应块
-			openAIResp := OpenAIStreamResponse{
-				ID:      "chatcmpl-" + fmt.Sprintf("%d", time.Now().Unix()),
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   reverseMapModelName(mapModelName(originalModel)), // 映射回 OpenAI 模型名称
-				Choices: []Choice{
-					{
-						Delta: Delta{
-							Content: token.YouChatToken, // 增量内容
-						},
-						Index:        0,
-						FinishReason: "", // 流式响应中通常为空
-					},
-				},
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(data, "data: ")), &token); err == nil {
+				// 发送标准内容块
+				sendContentChunk(w, token.YouChatToken)
 			}
-
-			respBytes, _ := json.Marshal(openAIResp)          // 将响应块序列化为 JSON
-			fmt.Fprintf(w, "data: %s\n\n", string(respBytes)) // 写入响应数据
-			w.(http.Flusher).Flush()                          // 立即刷新输出
 		}
 	}
 
-	// 发送完成事件
+	// 发送结束标志
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	w.(http.Flusher).Flush()
+}
+
+// 发送思考内容块
+func sendReasoningChunk(w http.ResponseWriter, content string) {
+	chunk := OpenAIStreamResponse{
+		ID:      "chatcmpl-" + uuid.New().String(),
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   reverseMapModelName(mapModelName(originalModel)),
+		Choices: []Choice{{
+			Delta: Delta{
+				ReasoningContent: content, // 使用专用字段
+			},
+		}},
+	}
+
+	if data, err := json.Marshal(chunk); err == nil {
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		w.(http.Flusher).Flush()
+	}
+}
+
+// 发送标准内容块（保持原有逻辑）
+func sendContentChunk(w http.ResponseWriter, content string) {
+	chunk := OpenAIStreamResponse{
+		ID:      "chatcmpl-" + uuid.New().String(),
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   reverseMapModelName(mapModelName(originalModel)),
+		Choices: []Choice{{
+			Delta: Delta{
+				Content: content, // 标准内容字段
+			},
+		}},
+	}
+
+	if data, err := json.Marshal(chunk); err == nil {
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		w.(http.Flusher).Flush()
+	}
 }
 
 // 获取上传文件所需的 nonce
