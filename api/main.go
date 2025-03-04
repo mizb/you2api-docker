@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -15,6 +16,11 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func init() {
+	// 初始化随机数生成器
+	rand.Seed(time.Now().UnixNano())
+}
 
 // TokenCount 定义了 token 计数的结构
 type TokenCount struct {
@@ -169,6 +175,12 @@ type UploadResponse struct {
 // 定义最大查询长度
 const MaxQueryLength = 2000
 
+// ChatEntry 定义了聊天历史中的单个问答对的结构
+type ChatEntry struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+}
+
 // Handler 是处理所有传入 HTTP 请求的主处理函数。
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// 处理 /v1/models 请求（列出可用模型）
@@ -243,77 +255,173 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// 转换 system 消息为 user 消息
 	openAIReq.Messages = convertSystemToUser(openAIReq.Messages)
 
+	// 打印OpenAI消息
+	fmt.Printf("\n=== 接收到的OpenAI消息 ===\n")
+	for i, msg := range openAIReq.Messages {
+		fmt.Printf("消息 %d: 角色=%s, 内容=%s\n", i, msg.Role, msg.Content)
+	}
+	fmt.Printf("===================\n\n")
+
 	// 构建 You.com 聊天历史
-	var chatHistory []map[string]interface{}
+	var chatHistory []ChatEntry
 	var sources []map[string]interface{}
-	var lastAssistantMessage string
 
 	// 处理历史消息（不包括最后一条）
-	for _, msg := range openAIReq.Messages[:len(openAIReq.Messages)-1] {
-		if msg.Role == "user" {
-			tokens, err := countTokens([]Message{msg})
-			if err != nil {
-				http.Error(w, "Failed to count tokens", http.StatusInternalServerError)
-				return
-			}
+	for i := 0; i < len(openAIReq.Messages)-1; i += 2 {
+		// 确保有足够的消息
+		if i+1 < len(openAIReq.Messages) {
+			// 获取当前对话的用户和助手消息
+			userMsg := openAIReq.Messages[i]
+			assistantMsg := openAIReq.Messages[i+1]
 
-			if tokens > MaxContextTokens {
-				// 获取 nonce
-				nonceResp, err := getNonce(dsToken)
-				if err != nil {
-					fmt.Printf("获取 nonce 失败: %v\n", err)
-					http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
-					return
+			fmt.Printf("处理对话对: 索引=%d-%d, 角色=%s-%s\n", i, i+1, userMsg.Role, assistantMsg.Role)
+
+			// 确保是用户-助手对
+			if userMsg.Role == "user" && assistantMsg.Role == "assistant" {
+				fmt.Printf("有效的用户-助手对话\n")
+
+				// 用户问题的内容
+				userContent := userMsg.Content
+
+				// 计算问题token数
+				questionTokenCount, _ := countTokens([]Message{userMsg})
+				fmt.Printf("用户问题token数: %d\n", questionTokenCount)
+
+				// 根据问题长度选择处理方式
+				if questionTokenCount < 30 {
+					// 短问题直接使用文字
+					fmt.Printf("短问题直接使用文字\n")
+
+					// 上传助手回答文件（无论问题长短，回答都上传）
+					_, err := getNonce(dsToken)
+					if err != nil {
+						fmt.Printf("获取nonce失败: %v\n", err)
+						http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
+						return
+					}
+
+					// 创建助手回答临时文件
+					assistantShortFileName := generateShortFileName()
+					assistantTempFile := assistantShortFileName + ".txt"
+
+					if err := os.WriteFile(assistantTempFile, addUTF8BOM(assistantMsg.Content), 0644); err != nil {
+						fmt.Printf("创建助手回答文件失败: %v\n", err)
+						http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+						return
+					}
+					defer os.Remove(assistantTempFile)
+
+					// 上传助手文件
+					assistantUploadResp, err := uploadFile(dsToken, assistantTempFile)
+					if err != nil {
+						fmt.Printf("上传助手文件失败: %v\n", err)
+						http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+						return
+					}
+
+					// 添加助手文件源信息
+					sources = append(sources, map[string]interface{}{
+						"source_type":   "user_file",
+						"filename":      assistantUploadResp.Filename,
+						"user_filename": assistantUploadResp.UserFilename,
+						"size_bytes":    len(assistantMsg.Content),
+					})
+
+					// 短问题+上传的助手回答
+					chatHistory = append(chatHistory, ChatEntry{
+						Question: userContent,
+						Answer:   fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(assistantUploadResp.UserFilename, ".txt")),
+					})
+				} else {
+					// 长问题需要上传文件
+					fmt.Printf("长问题上传文件\n")
+
+					// 上传用户问题文件
+					_, err := getNonce(dsToken)
+					if err != nil {
+						fmt.Printf("获取nonce失败: %v\n", err)
+						http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
+						return
+					}
+
+					// 创建用户问题临时文件
+					userShortFileName := generateShortFileName()
+					userTempFile := userShortFileName + ".txt"
+
+					if err := os.WriteFile(userTempFile, addUTF8BOM(userContent), 0644); err != nil {
+						fmt.Printf("创建用户问题文件失败: %v\n", err)
+						http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+						return
+					}
+					defer os.Remove(userTempFile)
+
+					// 上传用户文件
+					userUploadResp, err := uploadFile(dsToken, userTempFile)
+					if err != nil {
+						fmt.Printf("上传用户文件失败: %v\n", err)
+						http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+						return
+					}
+
+					// 添加用户文件源信息
+					sources = append(sources, map[string]interface{}{
+						"source_type":   "user_file",
+						"filename":      userUploadResp.Filename,
+						"user_filename": userUploadResp.UserFilename,
+						"size_bytes":    len(userContent),
+					})
+
+					// 上传助手回答文件
+					_, err = getNonce(dsToken)
+					if err != nil {
+						fmt.Printf("获取nonce失败: %v\n", err)
+						http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
+						return
+					}
+
+					// 创建助手回答临时文件
+					assistantShortFileName := generateShortFileName()
+					assistantTempFile := assistantShortFileName + ".txt"
+
+					if err := os.WriteFile(assistantTempFile, addUTF8BOM(assistantMsg.Content), 0644); err != nil {
+						fmt.Printf("创建助手回答文件失败: %v\n", err)
+						http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+						return
+					}
+					defer os.Remove(assistantTempFile)
+
+					// 上传助手文件
+					assistantUploadResp, err := uploadFile(dsToken, assistantTempFile)
+					if err != nil {
+						fmt.Printf("上传助手文件失败: %v\n", err)
+						http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+						return
+					}
+
+					// 添加助手文件源信息
+					sources = append(sources, map[string]interface{}{
+						"source_type":   "user_file",
+						"filename":      assistantUploadResp.Filename,
+						"user_filename": assistantUploadResp.UserFilename,
+						"size_bytes":    len(assistantMsg.Content),
+					})
+
+					// 添加问答对
+					chatHistory = append(chatHistory, ChatEntry{
+						Question: fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(userUploadResp.UserFilename, ".txt")),
+						Answer:   fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(assistantUploadResp.UserFilename, ".txt")),
+					})
 				}
-
-				// 创建临时文件
-				tempFile := fmt.Sprintf("temp_%s.txt", nonceResp.Uuid)
-				if err := os.WriteFile(tempFile, []byte(msg.Content), 0644); err != nil {
-					fmt.Printf("创建临时文件失败: %v\n", err)
-					http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-					return
-				}
-				defer os.Remove(tempFile)
-
-				// 上传文件
-				uploadResp, err := uploadFile(dsToken, tempFile)
-				if err != nil {
-					fmt.Printf("上传文件失败: %v\n", err)
-					http.Error(w, "Failed to upload file", http.StatusInternalServerError)
-					return
-				}
-
-				// 添加文件源信息
-				sources = append(sources, map[string]interface{}{
-					"source_type":   "user_file",
-					"filename":      uploadResp.Filename,
-					"user_filename": uploadResp.UserFilename,
-					"size_bytes":    len(msg.Content),
-				})
-
-				// 在历史记录中使用文件引用
-				chatHistory = append(chatHistory, map[string]interface{}{
-					"question": fmt.Sprintf("Please review the attached file: %s", uploadResp.UserFilename),
-					"answer":   "",
-				})
 			} else {
-				chatHistory = append(chatHistory, map[string]interface{}{
-					"question": msg.Content,
-					"answer":   "",
-				})
+				fmt.Printf("跳过无效对话对: 角色=%s-%s\n", userMsg.Role, assistantMsg.Role)
 			}
-		} else if msg.Role == "assistant" {
-			// 只保存最后一条 assistant 消息
-			lastAssistantMessage = msg.Content
 		}
 	}
 
-	// 如果有最后一条 assistant 消息，添加到历史记录中
-	if lastAssistantMessage != "" {
-		chatHistory = append(chatHistory, map[string]interface{}{
-			"question": "",
-			"answer":   lastAssistantMessage,
-		})
+	// 输出构建的聊天历史
+	fmt.Printf("聊天历史构建完成，共 %d 条记录\n", len(chatHistory))
+	for i, entry := range chatHistory {
+		fmt.Printf("历史 %d: Q=%s, A=%s\n", i, entry.Question, entry.Answer)
 	}
 
 	chatHistoryJSON, _ := json.Marshal(chatHistory)
@@ -340,8 +448,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// 设置基本参数
 	q.Add("page", "1")
 	q.Add("count", "10")
-	q.Add("safeSearch", "Off")
-	q.Add("mkt", "en-US")
+	q.Add("safeSearch", "Moderate")
+	q.Add("mkt", "zh-HK")
 	q.Add("enable_worklow_generation_ux", "true")
 	q.Add("domain", "youchat")
 	q.Add("use_personalization_extraction", "true")
@@ -357,17 +465,20 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// 如果最后一条消息超过限制，使用文件上传
 	if lastMessageTokens > MaxContextTokens {
-		// 获取 nonce
-		nonceResp, err := getNonce(dsToken)
+		// 获取 nonce - 不再需要nonce
+		_, err := getNonce(dsToken) // 仍然调用以保持API流程，但不使用返回值
 		if err != nil {
 			fmt.Printf("获取 nonce 失败: %v\n", err)
 			http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
 			return
 		}
 
-		// 创建临时文件
-		tempFile := fmt.Sprintf("temp_%s.txt", nonceResp.Uuid)
-		if err := os.WriteFile(tempFile, []byte(lastMessage.Content), 0644); err != nil {
+		// 创建临时文件，使用短文件名
+		shortFileName := generateShortFileName()
+		tempFile := shortFileName + ".txt"
+
+		// 确保使用UTF-8编码写入文件，添加BOM标记
+		if err := os.WriteFile(tempFile, addUTF8BOM(lastMessage.Content), 0644); err != nil {
 			fmt.Printf("创建临时文件失败: %v\n", err)
 			http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
 			return
@@ -394,8 +505,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		sourcesJSON, _ := json.Marshal(sources)
 		q.Add("sources", string(sourcesJSON))
 
-		// 使用文件引用作为查询
-		q.Add("q", fmt.Sprintf("Please review the attached file: %s", uploadResp.UserFilename))
+		// 使用文件引用作为查询，确保包含.txt后缀
+		q.Add("q", fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(uploadResp.UserFilename, ".txt")))
 	} else {
 		// 如果有之前上传的文件，添加 sources
 		if len(sources) > 0 {
@@ -407,6 +518,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	q.Add("chat", string(chatHistoryJSON))
 	youReq.URL.RawQuery = q.Encode()
+
+	// 添加调试信息
+	fmt.Printf("\n=== 聊天历史内容 ===\n")
+	fmt.Printf("历史条数: %d\n", len(chatHistory))
+	for i, entry := range chatHistory {
+		fmt.Printf("条目 %d:\n", i+1)
+		fmt.Printf("  问题: %s\n", entry.Question)
+		fmt.Printf("  回答: %s\n", entry.Answer)
+	}
+	fmt.Printf("chat参数内容: %s\n", string(chatHistoryJSON))
+	fmt.Printf("===================\n\n")
 
 	fmt.Printf("\n=== 完整请求信息 ===\n")
 	fmt.Printf("请求 URL: %s\n", youReq.URL.String())
@@ -684,6 +806,17 @@ func getNonce(dsToken string) (*NonceResponse, error) {
 	}, nil
 }
 
+// 生成短文件名
+func generateShortFileName() string {
+	// 生成6位纯英文字母字符串
+	const charset = "abcdefghijklmnopqrstuvwxyz"
+	result := make([]byte, 6)
+	for i := range result {
+		result[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(result)
+}
+
 // 上传文件
 func uploadFile(dsToken, filePath string) (*UploadResponse, error) {
 	file, err := os.Open(filePath)
@@ -714,10 +847,35 @@ func uploadFile(dsToken, filePath string) (*UploadResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	var uploadResp UploadResponse
-	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
+	// 打印上传响应状态码
+	fmt.Printf("文件上传响应状态码: %d\n", resp.StatusCode)
+
+	// 如果上传失败，记录错误响应
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		fmt.Printf("文件上传错误响应内容: %s\n", string(respBody))
+		return nil, fmt.Errorf("上传文件失败，状态码: %d", resp.StatusCode)
+	}
+
+	// 先读取完整的响应体
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
+
+	// 打印完整的响应内容
+	fmt.Printf("文件上传响应内容: %s\n", string(respBody))
+
+	// 解析响应
+	var uploadResp UploadResponse
+	if err := json.Unmarshal(respBody, &uploadResp); err != nil {
+		return nil, err
+	}
+
+	// 打印解析后的响应
+	fmt.Printf("上传文件成功: filename=%s, user_filename=%s\n",
+		uploadResp.Filename, uploadResp.UserFilename)
+
 	return &uploadResp, nil
 }
 
@@ -779,4 +937,32 @@ func convertSystemToUser(messages []Message) []Message {
 	}
 
 	return newMessages
+}
+
+// 添加UTF-8 BOM标记的函数
+func addUTF8BOM(content string) []byte {
+	// 首先确保内容是纯文本
+	content = ensurePlainText(content)
+	// UTF-8 BOM: EF BB BF
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	return append(bom, []byte(content)...)
+}
+
+// 确保内容为纯文本
+func ensurePlainText(content string) string {
+	// 移除可能导致问题的不可打印字符
+	var result strings.Builder
+	for _, r := range content {
+		// 只保留ASCII可打印字符、基本中文字符和基本标点符号
+		if (r >= 32 && r <= 126) || // ASCII可打印字符
+			(r >= 0x4E00 && r <= 0x9FA5) || // 基本汉字
+			(r >= 0x3000 && r <= 0x303F) || // 中文标点
+			r == 0x000A || r == 0x000D { // 换行和回车
+			result.WriteRune(r)
+		} else {
+			// 替换其他字符为空格
+			result.WriteRune(' ')
+		}
+	}
+	return result.String()
 }
