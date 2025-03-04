@@ -51,7 +51,7 @@ type Choice struct {
 // Delta 定义了流式响应中表示增量内容的结构。
 type Delta struct {
 	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	ReasoningContent string `json:"thinking_blocks,omitempty"`
 }
 
 // OpenAIRequest 定义了 OpenAI API 请求体的结构。
